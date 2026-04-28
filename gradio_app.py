@@ -9,6 +9,7 @@ import rembg
 import torch
 from PIL import Image
 from functools import partial
+import gradio_client.utils as gradio_client_utils
 
 from tsr.system import TSR
 from tsr.utils import remove_background, resize_foreground, to_gradio_3d_orientation
@@ -32,6 +33,26 @@ model.renderer.set_chunk_size(8192)
 model.to(device)
 
 rembg_session = rembg.new_session()
+
+
+_original_json_schema_to_python_type = gradio_client_utils._json_schema_to_python_type
+_original_get_type = gradio_client_utils.get_type
+
+
+def _safe_json_schema_to_python_type(schema, defs=None):
+    if isinstance(schema, bool):
+        return "Any"
+    return _original_json_schema_to_python_type(schema, defs)
+
+
+def _safe_get_type(schema):
+    if isinstance(schema, bool):
+        return {}
+    return _original_get_type(schema)
+
+
+gradio_client_utils._json_schema_to_python_type = _safe_json_schema_to_python_type
+gradio_client_utils.get_type = _safe_get_type
 
 
 def check_input_image(input_image):
@@ -211,5 +232,6 @@ if __name__ == '__main__':
         auth=(args.username, args.password) if (args.username and args.password) else None,
         share=args.share,
         server_name="0.0.0.0" if args.listen else None, 
-        server_port=args.port
+        server_port=args.port,
+        show_api=False,
     )
