@@ -47,6 +47,17 @@ For detailed usage of this script, use `python run.py --help`.
 python gradio_app.py
 ```
 
+### Background API
+Run the model once and expose it over HTTP for other projects:
+```sh
+python api.py --host 0.0.0.0 --port 8000
+```
+
+Example request:
+```sh
+curl -F "image=@examples/chair.png" http://127.0.0.1:8000/generate
+```
+
 ## Troubleshooting
 > AttributeError: module 'torchmcubes_module' has no attribute 'mcubes_cuda'
 
