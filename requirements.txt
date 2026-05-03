@@ -11,6 +11,7 @@ Pillow
 python-multipart
 rembg
 torch
+# torchmcubes compiles against torch; install this file with --no-build-isolation.
 git+https://github.com/tatsy/torchmcubes.git
 transformers
 trimesh
