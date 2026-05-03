@@ -29,7 +29,8 @@ model = TSR.from_pretrained(
 )
 
 # adjust the chunk size to balance between speed and memory usage
-model.renderer.set_chunk_size(8192)
+model.renderer.set_chunk_size(int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048")))
+model.eval()
 model.to(device)
 
 rembg_session = rembg.new_session()
@@ -107,8 +108,11 @@ def preprocess(input_image, do_remove_background, foreground_ratio):
 
 
 def generate(image, mc_resolution, formats=["obj", "glb"]):
-    scene_codes = model(image, device=device)
-    mesh = model.extract_mesh(scene_codes, True, resolution=mc_resolution)[0]
+    with torch.inference_mode():
+        scene_codes = model(image, device=device)
+        mesh = model.extract_mesh(scene_codes, True, resolution=mc_resolution)[0]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     mesh = to_gradio_3d_orientation(mesh)
     rv = []
     for format in formats:
@@ -164,7 +168,7 @@ with gr.Blocks(title="TripoSR") as interface:
                         label="Marching Cubes Resolution",
                         minimum=32,
                         maximum=320,
-                        value=256,
+                        value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "192")),
                         step=32
                     )
             with gr.Row():
@@ -225,9 +229,9 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=7860, help='Port to run the server listener on')
     parser.add_argument("--listen", action='store_true', help="launch gradio with 0.0.0.0 as server name, allowing to respond to network requests")
     parser.add_argument("--share", action='store_true', help="use share=True for gradio and make the UI accessible through their site")
-    parser.add_argument("--queuesize", type=int, default=1, help="launch gradio queue max_size")
+    parser.add_argument("--queuesize", type=int, default=8, help="launch gradio queue max_size")
     args = parser.parse_args()
-    interface.queue(max_size=args.queuesize)
+    interface.queue(max_size=args.queuesize, default_concurrency_limit=1)
     interface.launch(
         auth=(args.username, args.password) if (args.username and args.password) else None,
         share=args.share,

@@ -86,15 +86,15 @@ parser.add_argument(
 )
 parser.add_argument(
     "--chunk-size",
-    default=8192,
+    default=int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048")),
     type=int,
-    help="Evaluation chunk size for surface extraction and rendering. Smaller chunk size reduces VRAM usage but increases computation time. 0 for no chunking. Default: 8192",
+    help="Evaluation chunk size for surface extraction and rendering. Smaller chunk size reduces VRAM usage but increases computation time. 0 for no chunking. Default: 2048",
 )
 parser.add_argument(
     "--mc-resolution",
-    default=256,
+    default=int(os.getenv("TRIPOSR_MC_RESOLUTION", "192")),
     type=int,
-    help="Marching cubes grid resolution. Default: 256"
+    help="Marching cubes grid resolution. Default: 192"
 )
 parser.add_argument(
     "--no-remove-bg",
@@ -152,6 +152,7 @@ model = TSR.from_pretrained(
     weight_name="model.ckpt",
 )
 model.renderer.set_chunk_size(args.chunk_size)
+model.eval()
 model.to(device)
 timer.end("Initializing model")
 
@@ -182,7 +183,7 @@ for i, image in enumerate(images):
     logging.info(f"Running image {i + 1}/{len(images)} ...")
 
     timer.start("Running model")
-    with torch.no_grad():
+    with torch.inference_mode():
         scene_codes = model([image], device=device)
     timer.end("Running model")
 
@@ -235,3 +236,6 @@ for i, image in enumerate(images):
         timer.start("Exporting mesh")
         meshes[0].export(out_mesh_path)
         timer.end("Exporting mesh")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

@@ -26,17 +26,44 @@ The model is released under the MIT license, which includes the source code, pre
 
 ## Getting Started
 ### Installation
-- Python >= 3.8
-- Install CUDA if available
+- Use Python 3.10. Newer versions may work, but Python 3.10 is the safest target for the compiled ML/3D dependencies used by this project.
+- Install CUDA if available.
 - Install PyTorch according to your platform: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/) **[Please make sure that the locally-installed CUDA major version matches the PyTorch-shipped CUDA major version. For example if you have CUDA 11.x installed, make sure to install PyTorch compiled with CUDA 11.x.]**
-- Update setuptools by `pip install --upgrade setuptools`
-- Install other dependencies by `pip install -r requirements.txt`
+
+Create and activate a virtual environment:
+
+```sh
+python3.10 -m venv .venv
+source .venv/bin/activate
+```
+
+If `pip` is missing, enable or install it first:
+
+```sh
+python -m ensurepip --upgrade
+```
+
+On Debian/Ubuntu, if `ensurepip` is unavailable, install the system packages:
+
+```sh
+sudo apt update
+sudo apt install python3-pip python3-venv python3.10-venv
+```
+
+Then install the dependencies:
+
+```sh
+python -m pip install --upgrade pip setuptools
+python -m pip install -r requirements.txt
+```
+
+Use `python -m pip` instead of plain `pip` so the packages install into the active Python environment.
 
 ### Manual Inference
 ```sh
 python run.py examples/chair.png --output-dir output/
 ```
-This will save the reconstructed 3D model to `output/`. You can also specify more than one image path separated by spaces. The default options takes about **6GB VRAM** for a single image input.
+This will save the reconstructed 3D model to `output/`. You can also specify more than one image path separated by spaces. The local defaults are tuned for smaller GPUs: renderer chunk size `2048` and marching-cubes resolution `192`. Use `--mc-resolution 256` for more detail if your GPU has enough free VRAM.
 
 If you would like to output a texture instead of vertex colors, use the `--bake-texture` option. You may also use `--texture-resolution` to specify the resolution in pixels of the output texture.
 
@@ -47,10 +74,26 @@ For detailed usage of this script, use `python run.py --help`.
 python gradio_app.py
 ```
 
+The Gradio app uses a queue with one generation running at a time. This is recommended for laptops with 8 GB RAM / RTX 3050 Ti-class GPUs, because multiple simultaneous generations can exhaust memory. Incoming requests wait in the queue instead of starting extra model runs.
+
 ### Background API
 Run the model once and expose it over HTTP for other projects:
 ```sh
-python api.py --host 0.0.0.0 --port 8000
+python api.py --host 0.0.0.0 --port 8000 --workers 1 --max-concurrent-jobs 1 --queue-size 8
+```
+
+For your laptop spec, keep `--workers 1` and `--max-concurrent-jobs 1`. The API loads one model copy, accepts multiple requests, and runs heavy generation work through a bounded queue. You can check the queue and runtime defaults with:
+
+```sh
+curl http://127.0.0.1:8000/health
+```
+
+Each Uvicorn worker loads its own copy of the model. Use `--workers` greater than `1` only on machines with enough RAM/VRAM for multiple model copies. On an 8 GB RAM laptop, multiple workers are likely to cause memory pressure.
+
+Useful memory knobs:
+
+```sh
+TRIPOSR_RENDERER_CHUNK_SIZE=1024 TRIPOSR_MC_RESOLUTION=160 python api.py --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 Example request:
@@ -68,13 +111,13 @@ or
 This is because `torchmcubes` is compiled without CUDA support. Please make sure that 
 
 - The locally-installed CUDA major version matches the PyTorch-shipped CUDA major version. For example if you have CUDA 11.x installed, make sure to install PyTorch compiled with CUDA 11.x.
-- `setuptools>=49.6.0`. If not, upgrade by `pip install --upgrade setuptools`.
+- `setuptools>=49.6.0`. If not, upgrade by `python -m pip install --upgrade setuptools`.
 
 Then re-install `torchmcubes` by:
 
 ```sh
-pip uninstall torchmcubes
-pip install git+https://github.com/tatsy/torchmcubes.git
+python -m pip uninstall torchmcubes
+python -m pip install git+https://github.com/tatsy/torchmcubes.git
 ```
 
 ## Citation
