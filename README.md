@@ -26,9 +26,7 @@ The model is released under the MIT license, which includes the source code, pre
 
 ## Getting Started
 ### Installation
-- Use Python 3.10. Newer versions may work, but Python 3.10 is the safest target for the compiled ML/3D dependencies used by this project.
-- Install CUDA if available.
-- Install PyTorch according to your platform: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/) **[Please make sure that the locally-installed CUDA major version matches the PyTorch-shipped CUDA major version. For example if you have CUDA 11.x installed, make sure to install PyTorch compiled with CUDA 11.x.]**
+Use Python 3.10. Newer versions may work, but Python 3.10 is the safest target for the compiled ML/3D dependencies used by this project.
 
 Create and activate a virtual environment:
 
@@ -53,11 +51,13 @@ sudo apt install python3-pip python3-venv python3.10-venv
 Then install the dependencies:
 
 ```sh
-python -m pip install --upgrade pip setuptools
-python -m pip install -r requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --no-build-isolation -r requirements.txt
 ```
 
-Use `python -m pip` instead of plain `pip` so the packages install into the active Python environment.
+Use `python -m pip` instead of plain `pip` so the packages install into the active Python environment. The `--no-build-isolation` flag lets `torchmcubes` compile against the PyTorch package installed from `requirements.txt`.
+
+If you have an NVIDIA GPU and want CUDA acceleration, install CUDA first and make sure your system CUDA major version matches the PyTorch CUDA build. See the PyTorch selector for platform-specific commands: [https://pytorch.org/get-started/locally/](https://pytorch.org/get-started/locally/).
 
 ### Manual Inference
 ```sh
@@ -117,7 +117,7 @@ Then re-install `torchmcubes` by:
 
 ```sh
 python -m pip uninstall torchmcubes
-python -m pip install git+https://github.com/tatsy/torchmcubes.git
+python -m pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
 ```
 
 ## Citation
