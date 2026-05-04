@@ -9,7 +9,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     build-essential \
+    cmake \
     git \
+    ninja-build \
+    pybind11-dev \
   && rm -rf /var/lib/apt/lists/*
 
 RUN python -m venv /opt/venv
@@ -17,7 +20,9 @@ RUN python -m venv /opt/venv
 WORKDIR /app
 
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip setuptools wheel \
+RUN python -m pip install --upgrade pip setuptools wheel scikit-build-core \
+  && python -m pip install --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu torch==2.11.0+cpu \
+  && export CMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" \
   && python -m pip install --no-build-isolation -r requirements.txt
 
 

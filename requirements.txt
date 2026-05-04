@@ -10,7 +10,9 @@ omegaconf
 Pillow
 python-multipart
 rembg
-torch
+onnxruntime
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
 # torchmcubes compiles against torch; install this file with --no-build-isolation.
 git+https://github.com/tatsy/torchmcubes.git
 transformers
