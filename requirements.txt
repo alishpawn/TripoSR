@@ -15,7 +15,7 @@ onnxruntime
 torch==2.11.0+cpu
 # torchmcubes compiles against torch; install this file with --no-build-isolation.
 git+https://github.com/tatsy/torchmcubes.git
-transformers
+transformers==4.35.0
 trimesh
 uvicorn
 xatlas
