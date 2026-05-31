@@ -18,7 +18,12 @@ from PIL import Image
 
 from tsr.bake_texture import bake_texture
 from tsr.system import TSR
-from tsr.utils import remove_background, resize_foreground
+from tsr.utils import (
+    remove_background,
+    resize_foreground,
+    to_gradio_3d_orientation,
+    to_gradio_3d_orientation_arrays,
+)
 
 
 DEFAULT_RENDERER_CHUNK_SIZE = int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048"))
@@ -166,6 +171,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             faces = bake_output["indices"]
             uvs = bake_output["uvs"]
             normals = meshes[0].vertex_normals[bake_output["vmapping"]]
+            vertices, normals = to_gradio_3d_orientation_arrays(vertices, normals)
             texture_path = job_dir / "texture.png"
             texture_image = Image.fromarray((bake_output["colors"] * 255.0).astype(np.uint8)).transpose(Image.FLIP_TOP_BOTTOM)
             texture_image.save(texture_path)
@@ -188,6 +194,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 xatlas.export(str(mesh_path), vertices, faces, uvs, normals)
         else:
             mesh_path = job_dir / f"mesh.{model_save_format}"
+            meshes[0] = to_gradio_3d_orientation(meshes[0])
             meshes[0].export(mesh_path)
 
         if torch.cuda.is_available():

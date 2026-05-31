@@ -11,7 +11,13 @@ import xatlas
 from PIL import Image
 
 from tsr.system import TSR
-from tsr.utils import remove_background, resize_foreground, save_video
+from tsr.utils import (
+    remove_background,
+    resize_foreground,
+    save_video,
+    to_gradio_3d_orientation,
+    to_gradio_3d_orientation_arrays,
+)
 from tsr.bake_texture import bake_texture
 
 
@@ -213,6 +219,7 @@ for i, image in enumerate(images):
         faces = bake_output["indices"]
         uvs = bake_output["uvs"]
         normals = meshes[0].vertex_normals[bake_output["vmapping"]]
+        vertices, normals = to_gradio_3d_orientation_arrays(vertices, normals)
         texture_image = Image.fromarray(
             (bake_output["colors"] * 255.0).astype(np.uint8)
         ).transpose(Image.FLIP_TOP_BOTTOM)
@@ -234,6 +241,7 @@ for i, image in enumerate(images):
         timer.end("Exporting mesh and texture")
     else:
         timer.start("Exporting mesh")
+        meshes[0] = to_gradio_3d_orientation(meshes[0])
         meshes[0].export(out_mesh_path)
         timer.end("Exporting mesh")
 

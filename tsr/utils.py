@@ -472,3 +472,16 @@ def to_gradio_3d_orientation(mesh):
     mesh.apply_transform(trimesh.transformations.rotation_matrix(-np.pi/2, [1, 0, 0]))
     mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [0, 1, 0]))
     return mesh
+
+
+def to_gradio_3d_orientation_arrays(vertices, normals=None):
+    transform = (
+        trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+        @ trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+    )
+    vertices = trimesh.transformations.transform_points(vertices, transform)
+    if normals is None:
+        return vertices, None
+    normals = np.asarray(normals) @ transform[:3, :3].T
+    normals = normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
+    return vertices, normals
