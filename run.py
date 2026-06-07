@@ -18,7 +18,7 @@ from tsr.utils import (
     to_gradio_3d_orientation,
     to_gradio_3d_orientation_arrays,
 )
-from tsr.bake_texture import bake_texture
+from tsr.bake_texture import bake_texture, create_textured_visual
 
 
 class Timer:
@@ -98,9 +98,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--mc-resolution",
-    default=int(os.getenv("TRIPOSR_MC_RESOLUTION", "192")),
+    default=int(os.getenv("TRIPOSR_MC_RESOLUTION", "256")),
     type=int,
-    help="Marching cubes grid resolution. Default: 192"
+    help="Marching cubes grid resolution. Default: 256"
 )
 parser.add_argument(
     "--no-remove-bg",
@@ -136,6 +136,12 @@ parser.add_argument(
     default=2048,
     type=int,
     help="Texture atlas resolution, only useful with --bake-texture. Default: 2048"
+)
+parser.add_argument(
+    "--texture-brightness",
+    default=float(os.getenv("TRIPOSR_TEXTURE_BRIGHTNESS", "1.1")),
+    type=float,
+    help="Brightness multiplier for baked textures. Default: 1.1",
 )
 parser.add_argument(
     "--render",
@@ -181,7 +187,7 @@ for i, image_path in enumerate(args.image):
         image = Image.fromarray((image * 255.0).astype(np.uint8))
         if not os.path.exists(os.path.join(output_dir, str(i))):
             os.makedirs(os.path.join(output_dir, str(i)))
-        image.save(os.path.join(output_dir, str(i), f"input.png"))
+        image.save(os.path.join(output_dir, str(i), "input.png"))
     images.append(image)
 timer.end("Processing images")
 
@@ -199,7 +205,7 @@ for i, image in enumerate(images):
         for ri, render_image in enumerate(render_images[0]):
             render_image.save(os.path.join(output_dir, str(i), f"render_{ri:03d}.png"))
         save_video(
-            render_images[0], os.path.join(output_dir, str(i), f"render.mp4"), fps=30
+            render_images[0], os.path.join(output_dir, str(i), "render.mp4"), fps=30
         )
         timer.end("Rendering")
 
@@ -212,7 +218,13 @@ for i, image in enumerate(images):
         out_texture_path = os.path.join(output_dir, str(i), "texture.png")
 
         timer.start("Baking texture")
-        bake_output = bake_texture(meshes[0], model, scene_codes[0], args.texture_resolution)
+        bake_output = bake_texture(
+            meshes[0],
+            model,
+            scene_codes[0],
+            args.texture_resolution,
+            args.texture_brightness,
+        )
         timer.end("Baking texture")
 
         vertices = meshes[0].vertices[bake_output["vmapping"]]
@@ -226,7 +238,7 @@ for i, image in enumerate(images):
 
         timer.start("Exporting mesh and texture")
         if args.model_save_format == "glb":
-            visual = trimesh.visual.texture.TextureVisuals(uv=uvs, image=texture_image)
+            visual = create_textured_visual(uvs, texture_image)
             textured_mesh = trimesh.Trimesh(
                 vertices=vertices,
                 faces=faces,

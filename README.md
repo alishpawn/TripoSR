@@ -63,7 +63,7 @@ If you have an NVIDIA GPU and want CUDA acceleration, install CUDA first and mak
 ```sh
 python run.py examples/chair.png --output-dir output/
 ```
-This will save the reconstructed 3D model to `output/`. You can also specify more than one image path separated by spaces. The local defaults are tuned for smaller GPUs: renderer chunk size `2048` and marching-cubes resolution `192`. Use `--mc-resolution 256` for more detail if your GPU has enough free VRAM.
+This will save the reconstructed 3D model to `output/`. You can also specify more than one image path separated by spaces. The default marching-cubes resolution is `256` for a more detailed mesh. On GPUs with limited free VRAM, use `--mc-resolution 192` or set `TRIPOSR_MC_RESOLUTION=192`.
 
 If you would like to output a texture instead of vertex colors, use the `--bake-texture` option. You may also use `--texture-resolution` to specify the resolution in pixels of the output texture.
 
@@ -89,6 +89,9 @@ curl http://127.0.0.1:8000/health
 ```
 
 Each Uvicorn worker loads its own copy of the model. Use `--workers` greater than `1` only on machines with enough RAM/VRAM for multiple model copies. On an 8 GB RAM laptop, multiple workers are likely to cause memory pressure.
+
+The API preserves clean transparency from uploaded PNG/WebP images instead of removing the background a second time. Each successful response also includes `processed_image_url`, which shows the centered RGB image that was passed to the model.
+GLB generation bakes a slightly brightened, non-metallic texture by default so colors display consistently, and exported models open with the uploaded-image-facing side toward the viewer. Adjust brightness with the API `texture_brightness` field or CLI `--texture-brightness` option.
 
 Useful memory knobs:
 

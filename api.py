@@ -14,9 +14,9 @@ import trimesh
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 
-from tsr.bake_texture import bake_texture
+from tsr.bake_texture import bake_texture, create_textured_visual
 from tsr.system import TSR
 from tsr.utils import (
     remove_background,
@@ -27,8 +27,9 @@ from tsr.utils import (
 
 
 DEFAULT_RENDERER_CHUNK_SIZE = int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048"))
-DEFAULT_MC_RESOLUTION = int(os.getenv("TRIPOSR_MC_RESOLUTION", "192"))
-DEFAULT_TEXTURE_RESOLUTION = int(os.getenv("TRIPOSR_TEXTURE_RESOLUTION", "1024"))
+DEFAULT_MC_RESOLUTION = int(os.getenv("TRIPOSR_MC_RESOLUTION", "256"))
+DEFAULT_TEXTURE_RESOLUTION = int(os.getenv("TRIPOSR_TEXTURE_RESOLUTION", "2048"))
+DEFAULT_TEXTURE_BRIGHTNESS = float(os.getenv("TRIPOSR_TEXTURE_BRIGHTNESS", "1.1"))
 
 
 def configure_runtime(cpu_threads: int):
@@ -66,23 +67,27 @@ def adaptive_foreground_ratio(image, foreground_ratio):
     return foreground_ratio
 
 
+def has_transparency(image):
+    return image.mode == "RGBA" and image.getextrema()[3][0] < 255
+
+
 def preprocess(input_image, do_remove_background, foreground_ratio, rembg_session):
     def fill_background(image):
         image = np.array(image).astype(np.float32) / 255.0
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
         return Image.fromarray((image * 255.0).astype(np.uint8))
 
-    if do_remove_background:
-        image = input_image.convert("RGB")
-        image = remove_background(image, rembg_session)
+    image = ImageOps.exif_transpose(input_image)
+    if has_transparency(image):
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
         return fill_background(image)
 
-    image = input_image
-    if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
+    if do_remove_background:
+        image = remove_background(image.convert("RGB"), rembg_session)
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        image = fill_background(image)
-    return image
+        return fill_background(image)
+
+    return image.convert("RGB")
 
 
 def load_model(model_name_or_path: str, device: str):
@@ -138,6 +143,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 "renderer_chunk_size": DEFAULT_RENDERER_CHUNK_SIZE,
                 "default_mc_resolution": DEFAULT_MC_RESOLUTION,
                 "default_texture_resolution": DEFAULT_TEXTURE_RESOLUTION,
+                "default_texture_brightness": DEFAULT_TEXTURE_BRIGHTNESS,
                 "device": device,
             }
 
@@ -148,11 +154,18 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         mc_resolution: int,
         bake_texture_output: bool,
         texture_resolution: int,
+        texture_brightness: float,
         model_save_format: str,
     ):
         nonlocal rembg_session
-        input_image = Image.open(BytesIO(image_bytes)).convert("RGBA")
-        if remove_bg and rembg_session is None:
+        try:
+            input_image = Image.open(BytesIO(image_bytes))
+            input_image.load()
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError("uploaded file is not a valid image") from exc
+
+        input_image = ImageOps.exif_transpose(input_image)
+        if remove_bg and not has_transparency(input_image) and rembg_session is None:
             rembg_session = rembg.new_session()
         processed = preprocess(input_image, remove_bg, foreground_ratio, rembg_session)
         with torch.inference_mode():
@@ -162,11 +175,15 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         job_id = uuid.uuid4().hex
         job_dir = artifacts_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
+        processed_path = job_dir / "processed_input.png"
+        processed.save(processed_path)
 
         texture_url = None
 
         if bake_texture_output:
-            bake_output = bake_texture(meshes[0], model, scene_codes[0], texture_resolution)
+            bake_output = bake_texture(
+                meshes[0], model, scene_codes[0], texture_resolution, texture_brightness
+            )
             vertices = meshes[0].vertices[bake_output["vmapping"]]
             faces = bake_output["indices"]
             uvs = bake_output["uvs"]
@@ -179,7 +196,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
             mesh_path = job_dir / f"mesh.{model_save_format}"
             if model_save_format == "glb":
-                visual = trimesh.visual.texture.TextureVisuals(uv=uvs, image=texture_image)
+                visual = create_textured_visual(uvs, texture_image)
                 textured_mesh = trimesh.Trimesh(
                     vertices=vertices,
                     faces=faces,
@@ -204,6 +221,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             "job_id": job_id,
             "mesh_path": str(mesh_path),
             "mesh_url": f"/artifacts/{job_id}/{mesh_path.name}",
+            "processed_image_url": f"/artifacts/{job_id}/{processed_path.name}",
             "texture_url": texture_url,
         }
 
@@ -213,16 +231,21 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         remove_bg: bool = Form(True),
         foreground_ratio: float = Form(0.85),
         mc_resolution: int = Form(DEFAULT_MC_RESOLUTION),
-        bake_texture_output: bool = Form(False),
+        bake_texture_output: bool = Form(True),
         texture_resolution: int = Form(DEFAULT_TEXTURE_RESOLUTION),
+        texture_brightness: float = Form(DEFAULT_TEXTURE_BRIGHTNESS),
         model_save_format: str = Form("glb"),
     ):
         if model_save_format not in {"obj", "glb"}:
             raise HTTPException(status_code=400, detail="model_save_format must be obj or glb")
+        if not 0.5 <= foreground_ratio <= 1.0:
+            raise HTTPException(status_code=400, detail="foreground_ratio must be between 0.5 and 1.0")
         if not 32 <= mc_resolution <= 320:
             raise HTTPException(status_code=400, detail="mc_resolution must be between 32 and 320")
         if not 256 <= texture_resolution <= 4096:
             raise HTTPException(status_code=400, detail="texture_resolution must be between 256 and 4096")
+        if not 0.5 <= texture_brightness <= 2.0:
+            raise HTTPException(status_code=400, detail="texture_brightness must be between 0.5 and 2.0")
 
         image_bytes = await image.read()
         if not image_bytes:
@@ -243,16 +266,20 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     queued_jobs -= 1
                     running_jobs += 1
                     acquired_slot = True
-                result = await run_in_threadpool(
-                    generate_sync,
-                    image_bytes,
-                    remove_bg,
-                    foreground_ratio,
-                    mc_resolution,
-                    bake_texture_output,
-                    texture_resolution,
-                    model_save_format,
-                )
+                try:
+                    result = await run_in_threadpool(
+                        generate_sync,
+                        image_bytes,
+                        remove_bg,
+                        foreground_ratio,
+                        mc_resolution,
+                        bake_texture_output,
+                        texture_resolution,
+                        texture_brightness,
+                        model_save_format,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
                 result["queue_wait_seconds"] = queue_wait_seconds
                 return result
         finally:
