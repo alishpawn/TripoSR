@@ -1,13 +1,11 @@
-import logging
 import os
 import tempfile
-import time
 
 import gradio as gr
 import numpy as np
 import rembg
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 from functools import partial
 import gradio_client.utils as gradio_client_utils
 
@@ -87,6 +85,10 @@ def adaptive_foreground_ratio(image, foreground_ratio):
     return foreground_ratio
 
 
+def has_transparency(image):
+    return image.mode == "RGBA" and image.getextrema()[3][0] < 255
+
+
 def preprocess(input_image, do_remove_background, foreground_ratio):
     def fill_background(image):
         image = np.array(image).astype(np.float32) / 255.0
@@ -94,17 +96,17 @@ def preprocess(input_image, do_remove_background, foreground_ratio):
         image = Image.fromarray((image * 255.0).astype(np.uint8))
         return image
 
-    if do_remove_background:
-        image = input_image.convert("RGB")
-        image = remove_background(image, rembg_session)
+    image = ImageOps.exif_transpose(input_image)
+    if has_transparency(image):
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        image = fill_background(image)
-    else:
-        image = input_image
-        if image.mode == "RGBA" and image.getextrema()[3][0] < 255:
-            image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-            image = fill_background(image)
-    return image
+        return fill_background(image)
+
+    if do_remove_background:
+        image = remove_background(image.convert("RGB"), rembg_session)
+        image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
+        return fill_background(image)
+
+    return image.convert("RGB")
 
 
 def generate(image, mc_resolution, formats=["obj", "glb"]):
@@ -168,7 +170,7 @@ with gr.Blocks(title="TripoSR") as interface:
                         label="Marching Cubes Resolution",
                         minimum=32,
                         maximum=320,
-                        value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "192")),
+                        value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "256")),
                         step=32
                     )
             with gr.Row():

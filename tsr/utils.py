@@ -13,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import trimesh
 from omegaconf import DictConfig, OmegaConf
-from PIL import Image
 
 
 def parse_structured(fields: Any, cfg: Optional[Union[dict, DictConfig]] = None) -> Any:
@@ -470,13 +469,13 @@ def save_video(
 
 def to_gradio_3d_orientation(mesh):
     mesh.apply_transform(trimesh.transformations.rotation_matrix(-np.pi/2, [1, 0, 0]))
-    mesh.apply_transform(trimesh.transformations.rotation_matrix(np.pi/2, [0, 1, 0]))
+    mesh.apply_transform(trimesh.transformations.rotation_matrix(-np.pi/2, [0, 1, 0]))
     return mesh
 
 
 def to_gradio_3d_orientation_arrays(vertices, normals=None):
     transform = (
-        trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0])
+        trimesh.transformations.rotation_matrix(-np.pi / 2, [0, 1, 0])
         @ trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
     )
     vertices = trimesh.transformations.transform_points(vertices, transform)

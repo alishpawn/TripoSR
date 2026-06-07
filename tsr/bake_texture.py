@@ -1,9 +1,21 @@
 import numpy as np
 import torch
 import xatlas
-import trimesh
 import moderngl
-from PIL import Image
+import trimesh
+
+
+def create_standalone_context():
+    try:
+        return moderngl.create_context(standalone=True)
+    except Exception:
+        try:
+            return moderngl.create_context(standalone=True, backend="egl")
+        except Exception as egl_error:
+            raise RuntimeError(
+                "Texture baking requires an OpenGL context. Install/configure EGL "
+                "for headless generation or run with an available display."
+            ) from egl_error
 
 
 def make_atlas(mesh, texture_resolution, texture_padding):
@@ -25,7 +37,7 @@ def make_atlas(mesh, texture_resolution, texture_padding):
 def rasterize_position_atlas(
     mesh, atlas_vmapping, atlas_indices, atlas_uvs, texture_resolution, texture_padding
 ):
-    ctx = moderngl.create_context(standalone=True)
+    ctx = create_standalone_context()
     basic_prog = ctx.program(
         vertex_shader="""
             #version 330
@@ -148,7 +160,17 @@ def positions_to_colors(model, scene_code, positions_texture, texture_resolution
     return rgba_f.reshape(texture_resolution, texture_resolution, 4)
 
 
-def bake_texture(mesh, model, scene_code, texture_resolution):
+def create_textured_visual(uvs, texture_image):
+    material = trimesh.visual.material.PBRMaterial(
+        baseColorFactor=[255, 255, 255, 255],
+        baseColorTexture=texture_image,
+        metallicFactor=0.0,
+        roughnessFactor=0.8,
+    )
+    return trimesh.visual.texture.TextureVisuals(uv=uvs, material=material)
+
+
+def bake_texture(mesh, model, scene_code, texture_resolution, brightness=1.1):
     texture_padding = round(max(2, texture_resolution / 256))
     atlas = make_atlas(mesh, texture_resolution, texture_padding)
     positions_texture = rasterize_position_atlas(
@@ -162,6 +184,7 @@ def bake_texture(mesh, model, scene_code, texture_resolution):
     colors_texture = positions_to_colors(
         model, scene_code, positions_texture, texture_resolution
     )
+    colors_texture[..., :3] = np.clip(colors_texture[..., :3] * brightness, 0.0, 1.0)
     return {
         "vmapping": atlas["vmapping"],
         "indices": atlas["indices"],
