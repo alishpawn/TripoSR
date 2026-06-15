@@ -416,10 +416,19 @@ def remove_background(
 def resize_foreground(
     image: PIL.Image.Image,
     ratio: float,
+    alpha_threshold: int = 8,
 ) -> PIL.Image.Image:
     image = np.array(image)
     assert image.shape[-1] == 4
-    alpha = np.where(image[..., 3] > 0)
+    if not 0 < ratio <= 1:
+        raise ValueError("ratio must be greater than 0 and at most 1")
+
+    alpha = np.where(image[..., 3] > alpha_threshold)
+    if alpha[0].size == 0:
+        alpha = np.where(image[..., 3] > 0)
+    if alpha[0].size == 0:
+        raise ValueError("image has no visible foreground")
+
     y1, y2, x1, x2 = (
         alpha[0].min(),
         alpha[0].max(),
@@ -427,7 +436,7 @@ def resize_foreground(
         alpha[1].max(),
     )
     # crop the foreground
-    fg = image[y1:y2, x1:x2]
+    fg = image[y1 : y2 + 1, x1 : x2 + 1]
     # pad to square
     size = max(fg.shape[0], fg.shape[1])
     ph0, pw0 = (size - fg.shape[0]) // 2, (size - fg.shape[1]) // 2
@@ -452,6 +461,43 @@ def resize_foreground(
     )
     new_image = PIL.Image.fromarray(new_image)
     return new_image
+
+
+def remove_small_mesh_components(
+    mesh: trimesh.Trimesh,
+    min_component_area_ratio: float = 0.005,
+) -> trimesh.Trimesh:
+    """Remove tiny disconnected fragments while preserving meaningful parts."""
+    if min_component_area_ratio <= 0 or len(mesh.faces) == 0:
+        return mesh
+
+    components = trimesh.graph.connected_components(
+        mesh.face_adjacency,
+        nodes=np.arange(len(mesh.faces)),
+        min_len=1,
+    )
+    if not components:
+        return mesh
+
+    total_area = mesh.area_faces.sum()
+    if total_area <= 0:
+        return mesh
+
+    keep_faces = np.zeros(len(mesh.faces), dtype=bool)
+    for component in components:
+        component = np.asarray(component, dtype=np.int64)
+        if mesh.area_faces[component].sum() / total_area >= min_component_area_ratio:
+            keep_faces[component] = True
+    if not keep_faces.any():
+        largest = max(components, key=lambda component: mesh.area_faces[component].sum())
+        keep_faces[np.asarray(largest, dtype=np.int64)] = True
+    if keep_faces.all():
+        return mesh
+
+    cleaned = mesh.copy()
+    cleaned.update_faces(keep_faces)
+    cleaned.remove_unreferenced_vertices()
+    return cleaned
 
 
 def save_video(
@@ -484,3 +530,84 @@ def to_gradio_3d_orientation_arrays(vertices, normals=None):
     normals = np.asarray(normals) @ transform[:3, :3].T
     normals = normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
     return vertices, normals
+
+
+def infer_ar_orientation(image: PIL.Image.Image) -> str:
+    """Infer flat tabletop food versus an upright/front-view subject."""
+    image = np.asarray(image.convert("RGBA"))
+    alpha = image[..., 3]
+    if alpha.min() < 255:
+        visible = alpha > 8
+    else:
+        rgb = image[..., :3].astype(np.float32)
+        visible = np.max(np.abs(rgb - 127.5), axis=-1) > 20
+    if not visible.any():
+        return "upright"
+
+    ys, xs = np.where(visible)
+    width = xs.max() - xs.min() + 1
+    height = ys.max() - ys.min() + 1
+    return "flat" if width / max(height, 1) <= 1.15 else "upright"
+
+
+def prepare_vertices_for_ar(
+    vertices,
+    target_size_meters: float = 0.25,
+    orientation: str = "flat",
+):
+    """Orient, center, ground, and scale vertices for Y-up AR placement."""
+    vertices = np.asarray(vertices, dtype=np.float64).copy()
+    if len(vertices) == 0:
+        return vertices
+    if target_size_meters <= 0:
+        raise ValueError("target_size_meters must be greater than 0")
+
+    if orientation not in {"flat", "upright"}:
+        raise ValueError("orientation must be flat or upright")
+    if orientation == "flat":
+        # The image lies in XY and depth points along Z. Rotate it onto XZ.
+        rotation = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+        vertices = trimesh.transformations.transform_points(vertices, rotation)
+
+    bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
+    horizontal_size = max(bounds[1, 0] - bounds[0, 0], bounds[1, 2] - bounds[0, 2])
+    if horizontal_size > 0:
+        vertices *= target_size_meters / horizontal_size
+
+    bounds = np.array([vertices.min(axis=0), vertices.max(axis=0)])
+    vertices[:, 0] -= (bounds[0, 0] + bounds[1, 0]) / 2
+    vertices[:, 2] -= (bounds[0, 2] + bounds[1, 2]) / 2
+    vertices[:, 1] -= bounds[0, 1]
+    return vertices
+
+
+def prepare_normals_for_ar(normals, orientation: str = "flat"):
+    normals = np.asarray(normals, dtype=np.float64).copy()
+    if orientation == "upright":
+        return normals
+    if orientation != "flat":
+        raise ValueError("orientation must be flat or upright")
+    rotation = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+    normals = normals @ rotation[:3, :3].T
+    return normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8)
+
+
+def prepare_mesh_for_ar(mesh, target_size_meters: float = 0.25, orientation: str = "flat"):
+    if orientation not in {"flat", "upright"}:
+        raise ValueError("orientation must be flat or upright")
+    if orientation == "flat":
+        rotation = trimesh.transformations.rotation_matrix(-np.pi / 2, [1, 0, 0])
+        mesh.apply_transform(rotation)
+    bounds = mesh.bounds
+    horizontal_size = max(bounds[1, 0] - bounds[0, 0], bounds[1, 2] - bounds[0, 2])
+    if horizontal_size > 0:
+        mesh.apply_scale(target_size_meters / horizontal_size)
+    bounds = mesh.bounds
+    mesh.apply_translation(
+        [
+            -(bounds[0, 0] + bounds[1, 0]) / 2,
+            -bounds[0, 1],
+            -(bounds[0, 2] + bounds[1, 2]) / 2,
+        ]
+    )
+    return mesh

@@ -20,6 +20,10 @@ from tsr.bake_texture import bake_texture, create_textured_visual
 from tsr.system import TSR
 from tsr.utils import (
     remove_background,
+    prepare_mesh_for_ar,
+    prepare_normals_for_ar,
+    prepare_vertices_for_ar,
+    infer_ar_orientation,
     resize_foreground,
     to_gradio_3d_orientation,
     to_gradio_3d_orientation_arrays,
@@ -30,6 +34,11 @@ DEFAULT_RENDERER_CHUNK_SIZE = int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048
 DEFAULT_MC_RESOLUTION = int(os.getenv("TRIPOSR_MC_RESOLUTION", "256"))
 DEFAULT_TEXTURE_RESOLUTION = int(os.getenv("TRIPOSR_TEXTURE_RESOLUTION", "2048"))
 DEFAULT_TEXTURE_BRIGHTNESS = float(os.getenv("TRIPOSR_TEXTURE_BRIGHTNESS", "1.1"))
+DEFAULT_DENSITY_THRESHOLD = float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0"))
+DEFAULT_MIN_COMPONENT_AREA_RATIO = float(
+    os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")
+)
+DEFAULT_AR_SIZE_METERS = float(os.getenv("TRIPOSR_AR_SIZE_METERS", "0.25"))
 
 
 def configure_runtime(cpu_threads: int):
@@ -46,9 +55,9 @@ def alpha_coverage(image):
     if image.shape[-1] != 4:
         return None
     alpha = image[:, :, 3]
-    if not np.any(alpha > 0):
+    if not np.any(alpha > 8):
         return None
-    ys, xs = np.where(alpha > 0)
+    ys, xs = np.where(alpha > 8)
     height = ys.max() - ys.min() + 1
     width = xs.max() - xs.min() + 1
     return max(height / image.shape[0], width / image.shape[1])
@@ -144,6 +153,9 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 "default_mc_resolution": DEFAULT_MC_RESOLUTION,
                 "default_texture_resolution": DEFAULT_TEXTURE_RESOLUTION,
                 "default_texture_brightness": DEFAULT_TEXTURE_BRIGHTNESS,
+                "default_density_threshold": DEFAULT_DENSITY_THRESHOLD,
+                "default_min_component_area_ratio": DEFAULT_MIN_COMPONENT_AREA_RATIO,
+                "default_ar_size_meters": DEFAULT_AR_SIZE_METERS,
                 "device": device,
             }
 
@@ -155,6 +167,11 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         bake_texture_output: bool,
         texture_resolution: int,
         texture_brightness: float,
+        density_threshold: float,
+        min_component_area_ratio: float,
+        ar_ready: bool,
+        ar_size_meters: float,
+        ar_orientation: str,
         model_save_format: str,
     ):
         nonlocal rembg_session
@@ -168,9 +185,18 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         if remove_bg and not has_transparency(input_image) and rembg_session is None:
             rembg_session = rembg.new_session()
         processed = preprocess(input_image, remove_bg, foreground_ratio, rembg_session)
+        resolved_ar_orientation = (
+            infer_ar_orientation(processed) if ar_orientation == "auto" else ar_orientation
+        )
         with torch.inference_mode():
             scene_codes = model([processed], device=device)
-            meshes = model.extract_mesh(scene_codes, not bake_texture_output, resolution=mc_resolution)
+            meshes = model.extract_mesh(
+                scene_codes,
+                not bake_texture_output,
+                resolution=mc_resolution,
+                threshold=density_threshold,
+                min_component_area_ratio=min_component_area_ratio,
+            )
 
         job_id = uuid.uuid4().hex
         job_dir = artifacts_dir / job_id
@@ -189,6 +215,9 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             uvs = bake_output["uvs"]
             normals = meshes[0].vertex_normals[bake_output["vmapping"]]
             vertices, normals = to_gradio_3d_orientation_arrays(vertices, normals)
+            if ar_ready:
+                vertices = prepare_vertices_for_ar(vertices, ar_size_meters, resolved_ar_orientation)
+                normals = prepare_normals_for_ar(normals, resolved_ar_orientation)
             texture_path = job_dir / "texture.png"
             texture_image = Image.fromarray((bake_output["colors"] * 255.0).astype(np.uint8)).transpose(Image.FLIP_TOP_BOTTOM)
             texture_image.save(texture_path)
@@ -212,6 +241,10 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         else:
             mesh_path = job_dir / f"mesh.{model_save_format}"
             meshes[0] = to_gradio_3d_orientation(meshes[0])
+            if ar_ready:
+                meshes[0] = prepare_mesh_for_ar(
+                    meshes[0], ar_size_meters, resolved_ar_orientation
+                )
             meshes[0].export(mesh_path)
 
         if torch.cuda.is_available():
@@ -223,6 +256,9 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             "mesh_url": f"/artifacts/{job_id}/{mesh_path.name}",
             "processed_image_url": f"/artifacts/{job_id}/{processed_path.name}",
             "texture_url": texture_url,
+            "ar_ready": ar_ready,
+            "ar_size_meters": ar_size_meters if ar_ready else None,
+            "ar_orientation": resolved_ar_orientation if ar_ready else None,
         }
 
     @app.post("/generate")
@@ -234,6 +270,11 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         bake_texture_output: bool = Form(True),
         texture_resolution: int = Form(DEFAULT_TEXTURE_RESOLUTION),
         texture_brightness: float = Form(DEFAULT_TEXTURE_BRIGHTNESS),
+        density_threshold: float = Form(DEFAULT_DENSITY_THRESHOLD),
+        min_component_area_ratio: float = Form(DEFAULT_MIN_COMPONENT_AREA_RATIO),
+        ar_ready: bool = Form(True),
+        ar_size_meters: float = Form(DEFAULT_AR_SIZE_METERS),
+        ar_orientation: str = Form("auto"),
         model_save_format: str = Form("glb"),
     ):
         if model_save_format not in {"obj", "glb"}:
@@ -246,6 +287,22 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             raise HTTPException(status_code=400, detail="texture_resolution must be between 256 and 4096")
         if not 0.5 <= texture_brightness <= 2.0:
             raise HTTPException(status_code=400, detail="texture_brightness must be between 0.5 and 2.0")
+        if not 1.0 <= density_threshold <= 100.0:
+            raise HTTPException(status_code=400, detail="density_threshold must be between 1 and 100")
+        if not 0.0 <= min_component_area_ratio <= 0.1:
+            raise HTTPException(
+                status_code=400,
+                detail="min_component_area_ratio must be between 0 and 0.1",
+            )
+        if not 0.01 <= ar_size_meters <= 10.0:
+            raise HTTPException(status_code=400, detail="ar_size_meters must be between 0.01 and 10")
+        if ar_orientation not in {"auto", "flat", "upright"}:
+            raise HTTPException(
+                status_code=400,
+                detail="ar_orientation must be auto, flat, or upright",
+            )
+        if ar_ready and model_save_format != "glb":
+            raise HTTPException(status_code=400, detail="ar_ready output requires model_save_format=glb")
 
         image_bytes = await image.read()
         if not image_bytes:
@@ -276,6 +333,11 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                         bake_texture_output,
                         texture_resolution,
                         texture_brightness,
+                        density_threshold,
+                        min_component_area_ratio,
+                        ar_ready,
+                        ar_size_meters,
+                        ar_orientation,
                         model_save_format,
                     )
                 except ValueError as exc:
