@@ -67,6 +67,34 @@ This will save the reconstructed 3D model to `output/`. You can also specify mor
 
 If you would like to output a texture instead of vertex colors, use the `--bake-texture` option. You may also use `--texture-resolution` to specify the resolution in pixels of the output texture.
 
+For a higher-quality export with fewer floating fragments:
+
+```sh
+python run.py examples/chair.png \
+  --output-dir output/ \
+  --model-save-format glb \
+  --bake-texture \
+  --mc-resolution 320 \
+  --texture-resolution 4096 \
+  --density-threshold 25 \
+  --min-component-area-ratio 0.005 \
+  --ar-ready \
+  --ar-size-meters 0.25 \
+  --ar-orientation auto
+```
+
+Tune `--density-threshold` when the shape is too bulky or too thin. Higher values
+produce a thinner surface; lower values produce a fuller surface. Set
+`--min-component-area-ratio 0` when small disconnected parts are intentional.
+The foreground crop ignores nearly transparent background-removal noise and
+preserves the subject's complete edge pixels.
+
+`--ar-ready` exports a centered, grounded Y-up GLB at a predictable real-world
+size. With `--ar-orientation auto`, near-square top-down food is laid flat while
+wide front-view food remains upright. Use `flat` or `upright` to override
+ambiguous images. The API enables AR-ready auto orientation by default with a
+25 cm horizontal size.
+
 For detailed usage of this script, use `python run.py --help`.
 
 ### Local Gradio App
@@ -101,7 +129,16 @@ TRIPOSR_RENDERER_CHUNK_SIZE=1024 TRIPOSR_MC_RESOLUTION=160 python api.py --host 
 
 Example request:
 ```sh
-curl -F "image=@examples/chair.png" http://127.0.0.1:8000/generate
+curl \
+  -F "image=@examples/chair.png" \
+  -F "mc_resolution=320" \
+  -F "texture_resolution=4096" \
+  -F "density_threshold=25" \
+  -F "min_component_area_ratio=0.005" \
+  -F "ar_ready=true" \
+  -F "ar_size_meters=0.25" \
+  -F "ar_orientation=auto" \
+  http://127.0.0.1:8000/generate
 ```
 
 ## Troubleshooting

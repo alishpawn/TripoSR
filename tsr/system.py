@@ -19,6 +19,7 @@ from .utils import (
     ImagePreprocessor,
     find_class,
     get_spherical_cameras,
+    remove_small_mesh_components,
     scale_tensor,
 )
 
@@ -168,7 +169,14 @@ class TSR(BaseModule):
             return
         self.isosurface_helper = MarchingCubeHelper(resolution)
 
-    def extract_mesh(self, scene_codes, has_vertex_color, resolution: int = 256, threshold: float = 25.0):
+    def extract_mesh(
+        self,
+        scene_codes,
+        has_vertex_color,
+        resolution: int = 256,
+        threshold: float = 25.0,
+        min_component_area_ratio: float = 0.005,
+    ):
         self.set_marching_cubes_resolution(resolution)
         meshes = []
         for scene_code in scene_codes:
@@ -201,5 +209,6 @@ class TSR(BaseModule):
                 faces=t_pos_idx.cpu().numpy(),
                 vertex_colors=color.cpu().numpy() if has_vertex_color else None,
             )
+            mesh = remove_small_mesh_components(mesh, min_component_area_ratio)
             meshes.append(mesh)
         return meshes

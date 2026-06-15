@@ -13,6 +13,10 @@ from PIL import Image
 from tsr.system import TSR
 from tsr.utils import (
     remove_background,
+    prepare_mesh_for_ar,
+    prepare_normals_for_ar,
+    prepare_vertices_for_ar,
+    infer_ar_orientation,
     resize_foreground,
     save_video,
     to_gradio_3d_orientation,
@@ -52,9 +56,9 @@ def alpha_coverage(image):
     if image.shape[-1] != 4:
         return None
     alpha = image[:, :, 3]
-    if not np.any(alpha > 0):
+    if not np.any(alpha > 8):
         return None
-    ys, xs = np.where(alpha > 0)
+    ys, xs = np.where(alpha > 8)
     height = ys.max() - ys.min() + 1
     width = xs.max() - xs.min() + 1
     return max(height / image.shape[0], width / image.shape[1])
@@ -144,11 +148,48 @@ parser.add_argument(
     help="Brightness multiplier for baked textures. Default: 1.1",
 )
 parser.add_argument(
+    "--density-threshold",
+    default=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0")),
+    type=float,
+    help="Surface density threshold. Increase for a thinner mesh; decrease for a fuller mesh. Default: 25",
+)
+parser.add_argument(
+    "--min-component-area-ratio",
+    default=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")),
+    type=float,
+    help="Remove disconnected fragments smaller than this fraction of total surface area. Use 0 to disable. Default: 0.005",
+)
+parser.add_argument(
+    "--ar-ready",
+    action="store_true",
+    help="Center, ground, and scale a GLB for Y-up AR placement",
+)
+parser.add_argument(
+    "--ar-size-meters",
+    default=float(os.getenv("TRIPOSR_AR_SIZE_METERS", "0.25")),
+    type=float,
+    help="Longest horizontal size of an AR-ready model in meters. Default: 0.25",
+)
+parser.add_argument(
+    "--ar-orientation",
+    choices=["auto", "flat", "upright"],
+    default="auto",
+    help="AR placement orientation. Auto lays top-down food flat and keeps front views upright. Default: auto",
+)
+parser.add_argument(
     "--render",
     action="store_true",
     help="If specified, save a NeRF-rendered video. Default: false",
 )
 args = parser.parse_args()
+if not 1.0 <= args.density_threshold <= 100.0:
+    parser.error("--density-threshold must be between 1 and 100")
+if not 0.0 <= args.min_component_area_ratio <= 0.1:
+    parser.error("--min-component-area-ratio must be between 0 and 0.1")
+if not 0.01 <= args.ar_size_meters <= 10.0:
+    parser.error("--ar-size-meters must be between 0.01 and 10")
+if args.ar_ready and args.model_save_format != "glb":
+    parser.error("--ar-ready requires --model-save-format glb")
 
 output_dir = args.output_dir
 os.makedirs(output_dir, exist_ok=True)
@@ -170,6 +211,7 @@ timer.end("Initializing model")
 
 timer.start("Processing images")
 images = []
+ar_orientations = []
 
 if args.no_remove_bg:
     rembg_session = None
@@ -177,6 +219,7 @@ else:
     rembg_session = rembg.new_session()
 
 for i, image_path in enumerate(args.image):
+    os.makedirs(os.path.join(output_dir, str(i)), exist_ok=True)
     if args.no_remove_bg:
         image = np.array(Image.open(image_path).convert("RGB"))
     else:
@@ -185,10 +228,11 @@ for i, image_path in enumerate(args.image):
         image = np.array(image).astype(np.float32) / 255.0
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
         image = Image.fromarray((image * 255.0).astype(np.uint8))
-        if not os.path.exists(os.path.join(output_dir, str(i))):
-            os.makedirs(os.path.join(output_dir, str(i)))
         image.save(os.path.join(output_dir, str(i), "input.png"))
     images.append(image)
+    ar_orientations.append(
+        infer_ar_orientation(image) if args.ar_orientation == "auto" else args.ar_orientation
+    )
 timer.end("Processing images")
 
 for i, image in enumerate(images):
@@ -210,7 +254,13 @@ for i, image in enumerate(images):
         timer.end("Rendering")
 
     timer.start("Extracting mesh")
-    meshes = model.extract_mesh(scene_codes, not args.bake_texture, resolution=args.mc_resolution)
+    meshes = model.extract_mesh(
+        scene_codes,
+        not args.bake_texture,
+        resolution=args.mc_resolution,
+        threshold=args.density_threshold,
+        min_component_area_ratio=args.min_component_area_ratio,
+    )
     timer.end("Extracting mesh")
 
     out_mesh_path = os.path.join(output_dir, str(i), f"mesh.{args.model_save_format}")
@@ -232,6 +282,9 @@ for i, image in enumerate(images):
         uvs = bake_output["uvs"]
         normals = meshes[0].vertex_normals[bake_output["vmapping"]]
         vertices, normals = to_gradio_3d_orientation_arrays(vertices, normals)
+        if args.ar_ready:
+            vertices = prepare_vertices_for_ar(vertices, args.ar_size_meters, ar_orientations[i])
+            normals = prepare_normals_for_ar(normals, ar_orientations[i])
         texture_image = Image.fromarray(
             (bake_output["colors"] * 255.0).astype(np.uint8)
         ).transpose(Image.FLIP_TOP_BOTTOM)
@@ -254,6 +307,10 @@ for i, image in enumerate(images):
     else:
         timer.start("Exporting mesh")
         meshes[0] = to_gradio_3d_orientation(meshes[0])
+        if args.ar_ready:
+            meshes[0] = prepare_mesh_for_ar(
+                meshes[0], args.ar_size_meters, ar_orientations[i]
+            )
         meshes[0].export(out_mesh_path)
         timer.end("Exporting mesh")
 

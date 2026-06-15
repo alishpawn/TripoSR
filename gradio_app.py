@@ -10,7 +10,13 @@ from functools import partial
 import gradio_client.utils as gradio_client_utils
 
 from tsr.system import TSR
-from tsr.utils import remove_background, resize_foreground, to_gradio_3d_orientation
+from tsr.utils import (
+    infer_ar_orientation,
+    prepare_mesh_for_ar,
+    remove_background,
+    resize_foreground,
+    to_gradio_3d_orientation,
+)
 
 import argparse
 
@@ -64,9 +70,9 @@ def alpha_coverage(image):
     if image.shape[-1] != 4:
         return None
     alpha = image[:, :, 3]
-    if not np.any(alpha > 0):
+    if not np.any(alpha > 8):
         return None
-    ys, xs = np.where(alpha > 0)
+    ys, xs = np.where(alpha > 8)
     height = ys.max() - ys.min() + 1
     width = xs.max() - xs.min() + 1
     return max(height / image.shape[0], width / image.shape[1])
@@ -109,13 +115,31 @@ def preprocess(input_image, do_remove_background, foreground_ratio):
     return image.convert("RGB")
 
 
-def generate(image, mc_resolution, formats=["obj", "glb"]):
+def generate(
+    image,
+    mc_resolution,
+    density_threshold,
+    min_component_area_ratio,
+    ar_size_meters,
+    ar_orientation,
+    formats=["obj", "glb"],
+):
     with torch.inference_mode():
         scene_codes = model(image, device=device)
-        mesh = model.extract_mesh(scene_codes, True, resolution=mc_resolution)[0]
+        mesh = model.extract_mesh(
+            scene_codes,
+            True,
+            resolution=mc_resolution,
+            threshold=density_threshold,
+            min_component_area_ratio=min_component_area_ratio,
+        )[0]
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     mesh = to_gradio_3d_orientation(mesh)
+    resolved_ar_orientation = (
+        infer_ar_orientation(image) if ar_orientation == "auto" else ar_orientation
+    )
+    mesh = prepare_mesh_for_ar(mesh, ar_size_meters, resolved_ar_orientation)
     rv = []
     for format in formats:
         mesh_path = tempfile.NamedTemporaryFile(suffix=f".{format}", delete=False)
@@ -126,7 +150,9 @@ def generate(image, mc_resolution, formats=["obj", "glb"]):
 
 def run_example(image_pil):
     preprocessed = preprocess(image_pil, False, 0.9)
-    mesh_name_obj, mesh_name_glb = generate(preprocessed, 256, ["obj", "glb"])
+    mesh_name_obj, mesh_name_glb = generate(
+        preprocessed, 256, 25.0, 0.005, 0.25, "auto", ["obj", "glb"]
+    )
     return preprocessed, mesh_name_obj, mesh_name_glb
 
 
@@ -173,6 +199,32 @@ with gr.Blocks(title="TripoSR") as interface:
                         value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "256")),
                         step=32
                     )
+                    density_threshold = gr.Slider(
+                        label="Shape Density (higher = thinner)",
+                        minimum=10,
+                        maximum=40,
+                        value=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0")),
+                        step=1,
+                    )
+                    min_component_area_ratio = gr.Slider(
+                        label="Floating Fragment Cleanup",
+                        minimum=0,
+                        maximum=0.02,
+                        value=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")),
+                        step=0.001,
+                    )
+                    ar_size_meters = gr.Slider(
+                        label="AR Size (meters)",
+                        minimum=0.05,
+                        maximum=1.0,
+                        value=float(os.getenv("TRIPOSR_AR_SIZE_METERS", "0.25")),
+                        step=0.01,
+                    )
+                    ar_orientation = gr.Dropdown(
+                        label="AR Orientation",
+                        choices=["auto", "flat", "upright"],
+                        value="auto",
+                    )
             with gr.Row():
                 submit = gr.Button("Generate", elem_id="generate", variant="primary")
         with gr.Column():
@@ -218,7 +270,14 @@ with gr.Blocks(title="TripoSR") as interface:
         outputs=[processed_image],
     ).success(
         fn=generate,
-        inputs=[processed_image, mc_resolution],
+        inputs=[
+            processed_image,
+            mc_resolution,
+            density_threshold,
+            min_component_area_ratio,
+            ar_size_meters,
+            ar_orientation,
+        ],
         outputs=[output_model_obj, output_model_glb],
     )
 
