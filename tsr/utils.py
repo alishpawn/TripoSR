@@ -1,12 +1,13 @@
 import importlib
 import math
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import imageio
 import numpy as np
 import PIL.Image
+import PIL.ImageFilter
 import rembg
 import torch
 import torch.nn as nn
@@ -461,6 +462,106 @@ def resize_foreground(
     )
     new_image = PIL.Image.fromarray(new_image)
     return new_image
+
+
+def _connected_components(mask: np.ndarray) -> List[Tuple[int, int, int, int, int]]:
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    components = []
+
+    for start_y, start_x in np.argwhere(mask):
+        if visited[start_y, start_x]:
+            continue
+
+        area = 0
+        y1 = y2 = int(start_y)
+        x1 = x2 = int(start_x)
+        queue = deque([(int(start_y), int(start_x))])
+        visited[start_y, start_x] = True
+
+        while queue:
+            y, x = queue.popleft()
+            area += 1
+            y1 = min(y1, y)
+            y2 = max(y2, y)
+            x1 = min(x1, x)
+            x2 = max(x2, x)
+
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if (
+                    0 <= ny < height
+                    and 0 <= nx < width
+                    and mask[ny, nx]
+                    and not visited[ny, nx]
+                ):
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+
+        components.append((area, y1, y2, x1, x2))
+
+    return components
+
+
+def clean_foreground_alpha(
+    image: PIL.Image.Image,
+    alpha_threshold: int = 16,
+    min_component_area_ratio: float = 0.12,
+    component_analysis_size: int = 512,
+) -> PIL.Image.Image:
+    """Remove background-removal specks and detached props from an RGBA input."""
+    image = image.convert("RGBA")
+    alpha = np.array(image.getchannel("A"))
+    mask = alpha > alpha_threshold
+    if not mask.any():
+        return image
+
+    height, width = mask.shape
+    scale = min(1.0, component_analysis_size / max(height, width))
+    if scale < 1.0:
+        small_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        small_mask = np.array(
+            PIL.Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                small_size, PIL.Image.Resampling.NEAREST
+            )
+        ) > 0
+    else:
+        small_mask = mask
+
+    components = _connected_components(small_mask)
+    if not components:
+        return image
+
+    components.sort(reverse=True, key=lambda item: item[0])
+    largest_area = components[0][0]
+    keep = np.zeros_like(small_mask)
+    for area, y1, y2, x1, x2 in components:
+        if area / largest_area < min_component_area_ratio:
+            continue
+        keep[y1 : y2 + 1, x1 : x2 + 1] |= small_mask[y1 : y2 + 1, x1 : x2 + 1]
+
+    if keep.shape != mask.shape:
+        keep = np.array(
+            PIL.Image.fromarray(keep.astype(np.uint8) * 255).resize(
+                (width, height), PIL.Image.Resampling.NEAREST
+            )
+        ) > 0
+    keep &= mask
+
+    cleaned_alpha = np.where(keep, alpha, 0).astype(np.uint8)
+    cleaned_alpha = np.array(
+        PIL.Image.fromarray(cleaned_alpha).filter(PIL.ImageFilter.GaussianBlur(0.6))
+    )
+    cleaned = image.copy()
+    cleaned.putalpha(PIL.Image.fromarray(cleaned_alpha))
+    return cleaned
+
+
+def limit_image_size(image: PIL.Image.Image, max_size: int = 1024) -> PIL.Image.Image:
+    if max(image.size) <= max_size:
+        return image
+    image = image.copy()
+    image.thumbnail((max_size, max_size), PIL.Image.Resampling.LANCZOS)
+    return image
 
 
 def remove_small_mesh_components(
