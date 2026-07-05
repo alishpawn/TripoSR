@@ -11,7 +11,9 @@ import gradio_client.utils as gradio_client_utils
 
 from tsr.system import TSR
 from tsr.utils import (
+    clean_foreground_alpha,
     infer_ar_orientation,
+    limit_image_size,
     prepare_mesh_for_ar,
     remove_background,
     resize_foreground,
@@ -104,15 +106,17 @@ def preprocess(input_image, do_remove_background, foreground_ratio):
 
     image = ImageOps.exif_transpose(input_image)
     if has_transparency(image):
+        image = clean_foreground_alpha(image)
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        return fill_background(image)
+        return limit_image_size(fill_background(image))
 
     if do_remove_background:
         image = remove_background(image.convert("RGB"), rembg_session)
+        image = clean_foreground_alpha(image)
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        return fill_background(image)
+        return limit_image_size(fill_background(image))
 
-    return image.convert("RGB")
+    return limit_image_size(image.convert("RGB"))
 
 
 def generate(

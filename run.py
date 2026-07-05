@@ -12,6 +12,8 @@ from PIL import Image
 
 from tsr.system import TSR
 from tsr.utils import (
+    clean_foreground_alpha,
+    limit_image_size,
     remove_background,
     prepare_mesh_for_ar,
     prepare_normals_for_ar,
@@ -221,13 +223,14 @@ else:
 for i, image_path in enumerate(args.image):
     os.makedirs(os.path.join(output_dir, str(i)), exist_ok=True)
     if args.no_remove_bg:
-        image = np.array(Image.open(image_path).convert("RGB"))
+        image = np.array(limit_image_size(Image.open(image_path).convert("RGB")))
     else:
         image = remove_background(Image.open(image_path), rembg_session)
+        image = clean_foreground_alpha(image)
         image = resize_foreground(image, adaptive_foreground_ratio(image, args.foreground_ratio))
         image = np.array(image).astype(np.float32) / 255.0
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
-        image = Image.fromarray((image * 255.0).astype(np.uint8))
+        image = limit_image_size(Image.fromarray((image * 255.0).astype(np.uint8)))
         image.save(os.path.join(output_dir, str(i), "input.png"))
     images.append(image)
     ar_orientations.append(
