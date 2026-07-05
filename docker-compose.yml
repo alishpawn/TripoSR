@@ -1,0 +1,31 @@
+volumes:
+  tripo_data:
+
+services:
+  triposr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      HF_HOME: /data/output/huggingface
+      TRIPOSR_CPU_THREADS: "2"
+      TRIPOSR_RENDERER_CHUNK_SIZE: "1024"
+      TRIPOSR_MC_RESOLUTION: "192"
+      TRIPOSR_TEXTURE_RESOLUTION: "512"
+      TRIPOSR_MAX_CONCURRENT_JOBS: "1"
+      TRIPOSR_QUEUE_SIZE: "4"
+    volumes:
+      - tripo_data:/data
+    healthcheck:
+      start_period: 5m
+      test:
+        [
+          "CMD-SHELL",
+          "python - <<'PY'\nimport urllib.request\nprint(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read().decode())\nPY",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
