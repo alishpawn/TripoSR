@@ -223,7 +223,7 @@ else:
 for i, image_path in enumerate(args.image):
     os.makedirs(os.path.join(output_dir, str(i)), exist_ok=True)
     if args.no_remove_bg:
-        image = np.array(limit_image_size(Image.open(image_path).convert("RGB")))
+        image = limit_image_size(Image.open(image_path).convert("RGB"))
     else:
         image = remove_background(Image.open(image_path), rembg_session)
         image = clean_foreground_alpha(image)
