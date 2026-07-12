@@ -1,17 +1,21 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from io import BytesIO
 from pathlib import Path
+from typing import Optional
+from urllib import request as urllib_request
 
 import numpy as np
 import rembg
 import torch
 import trimesh
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -164,6 +168,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             }
 
     def generate_sync(
+        job_id: str,
         image_bytes: bytes,
         remove_bg: bool,
         foreground_ratio: float,
@@ -202,7 +207,6 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 min_component_area_ratio=min_component_area_ratio,
             )
 
-        job_id = uuid.uuid4().hex
         job_dir = artifacts_dir / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         processed_path = job_dir / "processed_input.png"
@@ -265,8 +269,117 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             "ar_orientation": resolved_ar_orientation if ar_ready else None,
         }
 
+    def send_webhook_sync(webhook_url: str, payload: dict, webhook_secret: Optional[str]):
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if webhook_secret:
+            headers["X-TripoSR-Signature"] = webhook_secret
+        req = urllib_request.Request(webhook_url, data=body, headers=headers, method="POST")
+        with urllib_request.urlopen(req, timeout=30) as response:
+            response.read()
+
+    async def send_webhook(webhook_url: Optional[str], payload: dict, webhook_secret: Optional[str]):
+        if not webhook_url:
+            return
+        try:
+            await run_in_threadpool(send_webhook_sync, webhook_url, payload, webhook_secret)
+        except Exception:
+            logging.exception("failed to send TripoSR webhook for job %s", payload.get("job_id"))
+
+    async def process_generation_job(
+        job_id: str,
+        job_ref: Optional[str],
+        webhook_url: Optional[str],
+        webhook_secret: Optional[str],
+        image_bytes: bytes,
+        remove_bg: bool,
+        foreground_ratio: float,
+        mc_resolution: int,
+        bake_texture_output: bool,
+        texture_resolution: int,
+        texture_brightness: float,
+        density_threshold: float,
+        min_component_area_ratio: float,
+        ar_ready: bool,
+        ar_size_meters: float,
+        ar_orientation: str,
+        model_save_format: str,
+        queued_at: float,
+    ):
+        nonlocal queued_jobs, running_jobs
+        acquired_slot = False
+        try:
+            async with job_slots:
+                queue_wait_seconds = round(time.monotonic() - queued_at, 3)
+                async with queue_lock:
+                    queued_jobs -= 1
+                    running_jobs += 1
+                    acquired_slot = True
+                try:
+                    result = await run_in_threadpool(
+                        generate_sync,
+                        job_id,
+                        image_bytes,
+                        remove_bg,
+                        foreground_ratio,
+                        mc_resolution,
+                        bake_texture_output,
+                        texture_resolution,
+                        texture_brightness,
+                        density_threshold,
+                        min_component_area_ratio,
+                        ar_ready,
+                        ar_size_meters,
+                        ar_orientation,
+                        model_save_format,
+                    )
+                except ValueError as exc:
+                    await send_webhook(
+                        webhook_url,
+                        {
+                            "job_id": job_id,
+                            "job_ref": job_ref,
+                            "status": "failed",
+                            "error": str(exc),
+                        },
+                        webhook_secret,
+                    )
+                    return
+                result["queue_wait_seconds"] = queue_wait_seconds
+                await send_webhook(
+                    webhook_url,
+                    {
+                        "job_id": job_id,
+                        "job_ref": job_ref,
+                        "status": "completed",
+                        "mesh_url": result["mesh_url"],
+                        "texture_url": result["texture_url"],
+                        "processed_image_url": result["processed_image_url"],
+                    },
+                    webhook_secret,
+                )
+        except Exception as exc:
+            logging.exception("TripoSR generation job %s failed", job_id)
+            await send_webhook(
+                webhook_url,
+                {
+                    "job_id": job_id,
+                    "job_ref": job_ref,
+                    "status": "failed",
+                    "error": str(exc),
+                },
+                webhook_secret,
+            )
+        finally:
+            async with queue_lock:
+                if acquired_slot and running_jobs > 0:
+                    running_jobs -= 1
+                elif not acquired_slot and queued_jobs > 0:
+                    queued_jobs -= 1
+
     @app.post("/generate")
     async def generate(
+        background_tasks: BackgroundTasks,
         image: UploadFile = File(...),
         remove_bg: bool = Form(True),
         foreground_ratio: float = Form(0.85),
@@ -280,6 +393,9 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         ar_size_meters: float = Form(DEFAULT_AR_SIZE_METERS),
         ar_orientation: str = Form("auto"),
         model_save_format: str = Form("glb"),
+        webhook_url: Optional[str] = Form(None),
+        webhook_job_ref: Optional[str] = Form(None),
+        webhook_secret: Optional[str] = Form(None),
     ):
         if model_save_format not in {"obj", "glb"}:
             raise HTTPException(status_code=400, detail="model_save_format must be obj or glb")
@@ -318,42 +434,37 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 raise HTTPException(status_code=429, detail="generation queue is full; try again later")
             queued_jobs += 1
 
+        job_id = uuid.uuid4().hex
         queued_at = time.monotonic()
-        acquired_slot = False
-        try:
-            async with job_slots:
-                queue_wait_seconds = round(time.monotonic() - queued_at, 3)
-                async with queue_lock:
-                    queued_jobs -= 1
-                    running_jobs += 1
-                    acquired_slot = True
-                try:
-                    result = await run_in_threadpool(
-                        generate_sync,
-                        image_bytes,
-                        remove_bg,
-                        foreground_ratio,
-                        mc_resolution,
-                        bake_texture_output,
-                        texture_resolution,
-                        texture_brightness,
-                        density_threshold,
-                        min_component_area_ratio,
-                        ar_ready,
-                        ar_size_meters,
-                        ar_orientation,
-                        model_save_format,
-                    )
-                except ValueError as exc:
-                    raise HTTPException(status_code=400, detail=str(exc)) from exc
-                result["queue_wait_seconds"] = queue_wait_seconds
-                return result
-        finally:
-            async with queue_lock:
-                if acquired_slot and running_jobs > 0:
-                    running_jobs -= 1
-                elif not acquired_slot and queued_jobs > 0:
-                    queued_jobs -= 1
+        background_tasks.add_task(
+            process_generation_job,
+            job_id,
+            webhook_job_ref,
+            webhook_url,
+            webhook_secret,
+            image_bytes,
+            remove_bg,
+            foreground_ratio,
+            mc_resolution,
+            bake_texture_output,
+            texture_resolution,
+            texture_brightness,
+            density_threshold,
+            min_component_area_ratio,
+            ar_ready,
+            ar_size_meters,
+            ar_orientation,
+            model_save_format,
+            queued_at,
+        )
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "job_id": job_id,
+                "status": "accepted",
+            },
+        )
 
     return app
 
