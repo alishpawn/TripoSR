@@ -147,6 +147,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
     job_slots = asyncio.Semaphore(max_concurrent_jobs)
     queued_jobs = 0
     running_jobs = 0
+    jobs = {}
 
     @app.get("/health")
     async def health():
@@ -166,6 +167,46 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 "default_ar_size_meters": DEFAULT_AR_SIZE_METERS,
                 "device": device,
             }
+
+    @app.get("/jobs/{job_id}")
+    async def get_job(job_id: str):
+        async with queue_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="job not found")
+            return job
+
+    @app.post("/jobs/{job_id}/webhook-retry")
+    async def retry_webhook(job_id: str):
+        async with queue_lock:
+            job = jobs.get(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="job not found")
+            if job.get("status") not in ("completed", "failed"):
+                raise HTTPException(
+                    status_code=409,
+                    detail="webhook can only be retried for completed or failed jobs",
+                )
+            webhook_url = job.get("webhook_url")
+            webhook_secret = job.get("webhook_secret")
+            payload = {
+                "job_id": job["job_id"],
+                "job_ref": job.get("job_ref"),
+                "status": job["status"],
+            }
+            if job["status"] == "completed":
+                payload["mesh_url"] = job.get("mesh_url")
+                payload["texture_url"] = job.get("texture_url")
+                payload["processed_image_url"] = job.get("processed_image_url")
+            else:
+                payload["error"] = job.get("error")
+        if not webhook_url:
+            raise HTTPException(status_code=400, detail="job has no webhook_url configured")
+        try:
+            await send_webhook(webhook_url, payload, webhook_secret)
+            return {"status": "ok", "message": "webhook resent"}
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"webhook failed: {exc}")
 
     def generate_sync(
         job_id: str,
@@ -315,6 +356,19 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     queued_jobs -= 1
                     running_jobs += 1
                     acquired_slot = True
+                    jobs[job_id].update(
+                        {
+                            "status": "running",
+                            "queue_wait_seconds": queue_wait_seconds,
+                            "started_at": time.time(),
+                        }
+                    )
+                logging.info(
+                    "TripoSR job %s started%s after %.3fs in queue",
+                    job_id,
+                    f" for ref {job_ref}" if job_ref else "",
+                    queue_wait_seconds,
+                )
                 try:
                     result = await run_in_threadpool(
                         generate_sync,
@@ -334,6 +388,15 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                         model_save_format,
                     )
                 except ValueError as exc:
+                    async with queue_lock:
+                        jobs[job_id].update(
+                            {
+                                "status": "failed",
+                                "error": str(exc),
+                                "finished_at": time.time(),
+                            }
+                        )
+                    logging.warning("TripoSR job %s failed validation: %s", job_id, exc)
                     await send_webhook(
                         webhook_url,
                         {
@@ -346,6 +409,22 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     )
                     return
                 result["queue_wait_seconds"] = queue_wait_seconds
+                async with queue_lock:
+                    jobs[job_id].update(
+                        {
+                            "status": "completed",
+                            "finished_at": time.time(),
+                            "mesh_url": result["mesh_url"],
+                            "texture_url": result["texture_url"],
+                            "processed_image_url": result["processed_image_url"],
+                        }
+                    )
+                logging.info(
+                    "TripoSR job %s completed%s mesh=%s",
+                    job_id,
+                    f" for ref {job_ref}" if job_ref else "",
+                    result["mesh_url"],
+                )
                 await send_webhook(
                     webhook_url,
                     {
@@ -360,6 +439,15 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 )
         except Exception as exc:
             logging.exception("TripoSR generation job %s failed", job_id)
+            async with queue_lock:
+                if job_id in jobs:
+                    jobs[job_id].update(
+                        {
+                            "status": "failed",
+                            "error": str(exc),
+                            "finished_at": time.time(),
+                        }
+                    )
             await send_webhook(
                 webhook_url,
                 {
@@ -436,6 +524,23 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
         job_id = uuid.uuid4().hex
         queued_at = time.monotonic()
+        async with queue_lock:
+            jobs[job_id] = {
+                "job_id": job_id,
+                "job_ref": webhook_job_ref,
+                "status": "queued",
+                "queued_at": time.time(),
+                "webhook_url": webhook_url,
+                "webhook_secret": webhook_secret,
+            }
+        logging.info(
+            "TripoSR job %s accepted%s remove_bg=%s mc_resolution=%s texture_resolution=%s",
+            job_id,
+            f" for ref {webhook_job_ref}" if webhook_job_ref else "",
+            remove_bg,
+            mc_resolution,
+            texture_resolution,
+        )
         background_tasks.add_task(
             process_generation_job,
             job_id,
