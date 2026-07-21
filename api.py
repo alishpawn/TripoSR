@@ -312,7 +312,10 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
     def send_webhook_sync(webhook_url: str, payload: dict, webhook_secret: Optional[str]):
         body = json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "RestroSphere-TripoSR/1.0",
+        }
         if webhook_secret:
             headers["X-TripoSR-Signature"] = webhook_secret
         req = urllib_request.Request(webhook_url, data=body, headers=headers, method="POST")
