@@ -20,10 +20,10 @@ RUN python -m venv /opt/venv
 WORKDIR /app
 
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip setuptools wheel scikit-build-core \
-  && python -m pip install --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu torch==2.11.0+cpu \
+RUN python -m pip install --no-compile --upgrade pip setuptools wheel scikit-build-core \
+  && python -m pip install --no-compile --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu torch==2.11.0+cpu \
   && export CMAKE_PREFIX_PATH="$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}" \
-  && python -m pip install --no-build-isolation -r requirements.txt
+  && python -m pip install --no-compile --no-build-isolation -r requirements.txt
 
 
 FROM python:3.10-slim
@@ -48,10 +48,10 @@ RUN useradd --create-home --shell /bin/bash appuser
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY . .
+COPY --chown=appuser:appuser . .
 
 RUN mkdir -p /data/output \
-  && chown -R appuser:appuser /app /data/output /opt/venv
+  && chown appuser:appuser /data/output
 
 USER appuser
 
