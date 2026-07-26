@@ -8,7 +8,7 @@ import rembg
 import torch
 import trimesh
 import xatlas
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 from tsr.system import TSR
 from tsr.utils import (
@@ -79,6 +79,16 @@ def adaptive_foreground_ratio(image, foreground_ratio):
     return foreground_ratio
 
 
+def enhance_image(image: Image.Image) -> Image.Image:
+    """Enhance image to improve 3D reconstruction: better contrast, sharper edges, richer colors."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    image = ImageEnhance.Contrast(image).enhance(1.2)
+    image = ImageEnhance.Sharpness(image).enhance(1.3)
+    image = ImageEnhance.Color(image).enhance(1.1)
+    return image
+
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -104,9 +114,9 @@ parser.add_argument(
 )
 parser.add_argument(
     "--mc-resolution",
-    default=int(os.getenv("TRIPOSR_MC_RESOLUTION", "256")),
+    default=int(os.getenv("TRIPOSR_MC_RESOLUTION", "288")),
     type=int,
-    help="Marching cubes grid resolution. Default: 256"
+    help="Marching cubes grid resolution. Higher captures more detail (wings, thin structures). Default: 288"
 )
 parser.add_argument(
     "--no-remove-bg",
@@ -151,15 +161,15 @@ parser.add_argument(
 )
 parser.add_argument(
     "--density-threshold",
-    default=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0")),
+    default=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "22.0")),
     type=float,
-    help="Surface density threshold. Increase for a thinner mesh; decrease for a fuller mesh. Default: 25",
+    help="Surface density threshold. Increase for a thinner mesh; decrease for a fuller mesh. Default: 22",
 )
 parser.add_argument(
     "--min-component-area-ratio",
-    default=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")),
+    default=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.003")),
     type=float,
-    help="Remove disconnected fragments smaller than this fraction of total surface area. Use 0 to disable. Default: 0.005",
+    help="Remove disconnected fragments smaller than this fraction of total surface area. Use 0 to disable. Default: 0.003",
 )
 parser.add_argument(
     "--ar-ready",
@@ -182,6 +192,11 @@ parser.add_argument(
     "--render",
     action="store_true",
     help="If specified, save a NeRF-rendered video. Default: false",
+)
+parser.add_argument(
+    "--enhance",
+    action="store_true",
+    help="Enhance input image (contrast, sharpness, color) before reconstruction. Improves detail for complex shapes like planes.",
 )
 args = parser.parse_args()
 if not 1.0 <= args.density_threshold <= 100.0:
@@ -232,6 +247,8 @@ for i, image_path in enumerate(args.image):
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
         image = limit_image_size(Image.fromarray((image * 255.0).astype(np.uint8)))
         image.save(os.path.join(output_dir, str(i), "input.png"))
+    if args.enhance:
+        image = enhance_image(image)
     images.append(image)
     ar_orientations.append(
         infer_ar_orientation(image) if args.ar_orientation == "auto" else args.ar_orientation

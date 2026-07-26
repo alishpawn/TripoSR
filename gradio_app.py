@@ -5,7 +5,7 @@ import gradio as gr
 import numpy as np
 import rembg
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageEnhance
 from functools import partial
 import gradio_client.utils as gradio_client_utils
 
@@ -97,7 +97,17 @@ def has_transparency(image):
     return image.mode == "RGBA" and image.getextrema()[3][0] < 255
 
 
-def preprocess(input_image, do_remove_background, foreground_ratio):
+def enhance_image(image: Image.Image) -> Image.Image:
+    """Enhance image to improve 3D reconstruction: better contrast, sharper edges, richer colors."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    image = ImageEnhance.Contrast(image).enhance(1.2)
+    image = ImageEnhance.Sharpness(image).enhance(1.3)
+    image = ImageEnhance.Color(image).enhance(1.1)
+    return image
+
+
+def preprocess(input_image, do_remove_background, foreground_ratio, do_enhance=False):
     def fill_background(image):
         image = np.array(image).astype(np.float32) / 255.0
         image = image[:, :, :3] * image[:, :, 3:4] + (1 - image[:, :, 3:4]) * 0.5
@@ -108,15 +118,18 @@ def preprocess(input_image, do_remove_background, foreground_ratio):
     if has_transparency(image):
         image = clean_foreground_alpha(image)
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        return limit_image_size(fill_background(image))
-
-    if do_remove_background:
+        image = limit_image_size(fill_background(image))
+    elif do_remove_background:
         image = remove_background(image.convert("RGB"), rembg_session)
         image = clean_foreground_alpha(image)
         image = resize_foreground(image, adaptive_foreground_ratio(image, foreground_ratio))
-        return limit_image_size(fill_background(image))
+        image = limit_image_size(fill_background(image))
+    else:
+        image = limit_image_size(image.convert("RGB"))
 
-    return limit_image_size(image.convert("RGB"))
+    if do_enhance:
+        image = enhance_image(image)
+    return image
 
 
 def generate(
@@ -153,9 +166,9 @@ def generate(
 
 
 def run_example(image_pil):
-    preprocessed = preprocess(image_pil, False, 0.9)
+    preprocessed = preprocess(image_pil, False, 0.9, do_enhance=True)
     mesh_name_obj, mesh_name_glb = generate(
-        preprocessed, 256, 25.0, 0.005, 0.25, "auto", ["obj", "glb"]
+        preprocessed, 288, 22.0, 0.003, 0.25, "auto", ["obj", "glb"]
     )
     return preprocessed, mesh_name_obj, mesh_name_glb
 
@@ -189,6 +202,10 @@ with gr.Blocks(title="TripoSR") as interface:
                     do_remove_background = gr.Checkbox(
                         label="Remove Background", value=True
                     )
+                    do_enhance = gr.Checkbox(
+                        label="Enhance Image (improves detail for complex shapes)",
+                        value=True,
+                    )
                     foreground_ratio = gr.Slider(
                         label="Foreground Ratio",
                         minimum=0.5,
@@ -200,21 +217,21 @@ with gr.Blocks(title="TripoSR") as interface:
                         label="Marching Cubes Resolution",
                         minimum=32,
                         maximum=320,
-                        value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "256")),
+                        value=int(os.getenv("TRIPOSR_MC_RESOLUTION", "288")),
                         step=32
                     )
                     density_threshold = gr.Slider(
                         label="Shape Density (higher = thinner)",
                         minimum=10,
                         maximum=40,
-                        value=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0")),
+                        value=float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "22.0")),
                         step=1,
                     )
                     min_component_area_ratio = gr.Slider(
                         label="Floating Fragment Cleanup",
                         minimum=0,
                         maximum=0.02,
-                        value=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")),
+                        value=float(os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.003")),
                         step=0.001,
                     )
                     ar_size_meters = gr.Slider(
@@ -270,7 +287,7 @@ with gr.Blocks(title="TripoSR") as interface:
         )
     submit.click(fn=check_input_image, inputs=[input_image]).success(
         fn=preprocess,
-        inputs=[input_image, do_remove_background, foreground_ratio],
+        inputs=[input_image, do_remove_background, foreground_ratio, do_enhance],
         outputs=[processed_image],
     ).success(
         fn=generate,

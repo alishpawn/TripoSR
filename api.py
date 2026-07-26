@@ -18,7 +18,7 @@ from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadF
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageOps, UnidentifiedImageError
 
 from tsr.bake_texture import bake_texture, create_textured_visual
 from tsr.system import TSR
@@ -37,12 +37,12 @@ from tsr.utils import (
 
 
 DEFAULT_RENDERER_CHUNK_SIZE = int(os.getenv("TRIPOSR_RENDERER_CHUNK_SIZE", "2048"))
-DEFAULT_MC_RESOLUTION = int(os.getenv("TRIPOSR_MC_RESOLUTION", "256"))
+DEFAULT_MC_RESOLUTION = int(os.getenv("TRIPOSR_MC_RESOLUTION", "288"))
 DEFAULT_TEXTURE_RESOLUTION = int(os.getenv("TRIPOSR_TEXTURE_RESOLUTION", "2048"))
-DEFAULT_TEXTURE_BRIGHTNESS = float(os.getenv("TRIPOSR_TEXTURE_BRIGHTNESS", "1.1"))
-DEFAULT_DENSITY_THRESHOLD = float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "25.0"))
+DEFAULT_TEXTURE_BRIGHTNESS = float(os.getenv("TRIPOSR_TEXTURE_BRIGHTNESS", "1.15"))
+DEFAULT_DENSITY_THRESHOLD = float(os.getenv("TRIPOSR_DENSITY_THRESHOLD", "22.0"))
 DEFAULT_MIN_COMPONENT_AREA_RATIO = float(
-    os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.005")
+    os.getenv("TRIPOSR_MIN_COMPONENT_AREA_RATIO", "0.003")
 )
 DEFAULT_AR_SIZE_METERS = float(os.getenv("TRIPOSR_AR_SIZE_METERS", "0.25"))
 
@@ -84,6 +84,16 @@ def adaptive_foreground_ratio(image, foreground_ratio):
 
 def has_transparency(image):
     return image.mode == "RGBA" and image.getextrema()[3][0] < 255
+
+
+def enhance_image(image: Image.Image) -> Image.Image:
+    """Enhance image to improve 3D reconstruction: better contrast, sharper edges, richer colors."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    image = ImageEnhance.Contrast(image).enhance(1.2)
+    image = ImageEnhance.Sharpness(image).enhance(1.3)
+    image = ImageEnhance.Color(image).enhance(1.1)
+    return image
 
 
 def preprocess(input_image, do_remove_background, foreground_ratio, rembg_session):
@@ -208,6 +218,12 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"webhook failed: {exc}")
 
+    def set_job_progress_sync(job_id: str, progress: int, stage: str):
+        job = jobs.get(job_id)
+        if job is not None:
+            job["progress"] = max(0, min(100, int(progress)))
+            job["stage"] = stage
+
     def generate_sync(
         job_id: str,
         image_bytes: bytes,
@@ -223,9 +239,11 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         ar_size_meters: float,
         ar_orientation: str,
         model_save_format: str,
+        enhance: bool = False,
     ):
         nonlocal rembg_session
         try:
+            set_job_progress_sync(job_id, 10, "Reading image")
             input_image = Image.open(BytesIO(image_bytes))
             input_image.load()
         except (UnidentifiedImageError, OSError) as exc:
@@ -234,12 +252,17 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         input_image = ImageOps.exif_transpose(input_image)
         if remove_bg and not has_transparency(input_image) and rembg_session is None:
             rembg_session = rembg.new_session()
+        set_job_progress_sync(job_id, 20, "Preparing image")
         processed = preprocess(input_image, remove_bg, foreground_ratio, rembg_session)
+        if enhance:
+            processed = enhance_image(processed)
         resolved_ar_orientation = (
             infer_ar_orientation(processed) if ar_orientation == "auto" else ar_orientation
         )
         with torch.inference_mode():
+            set_job_progress_sync(job_id, 35, "Running model")
             scene_codes = model([processed], device=device)
+            set_job_progress_sync(job_id, 60, "Extracting mesh")
             meshes = model.extract_mesh(
                 scene_codes,
                 not bake_texture_output,
@@ -256,6 +279,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         texture_url = None
 
         if bake_texture_output:
+            set_job_progress_sync(job_id, 75, "Baking texture")
             bake_output = bake_texture(
                 meshes[0], model, scene_codes[0], texture_resolution, texture_brightness
             )
@@ -274,6 +298,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
             mesh_path = job_dir / f"mesh.{model_save_format}"
             if model_save_format == "glb":
+                set_job_progress_sync(job_id, 90, "Exporting GLB")
                 visual = create_textured_visual(uvs, texture_image)
                 textured_mesh = trimesh.Trimesh(
                     vertices=vertices,
@@ -288,6 +313,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
                 xatlas.export(str(mesh_path), vertices, faces, uvs, normals)
         else:
+            set_job_progress_sync(job_id, 85, "Exporting mesh")
             mesh_path = job_dir / f"mesh.{model_save_format}"
             meshes[0] = to_gradio_3d_orientation(meshes[0])
             if ar_ready:
@@ -298,6 +324,8 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        set_job_progress_sync(job_id, 95, "Finalizing")
 
         return {
             "job_id": job_id,
@@ -349,6 +377,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         ar_orientation: str,
         model_save_format: str,
         queued_at: float,
+        enhance: bool = False,
     ):
         nonlocal queued_jobs, running_jobs
         acquired_slot = False
@@ -362,6 +391,8 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     jobs[job_id].update(
                         {
                             "status": "running",
+                            "progress": max(jobs[job_id].get("progress", 0), 5),
+                            "stage": "Starting",
                             "queue_wait_seconds": queue_wait_seconds,
                             "started_at": time.time(),
                         }
@@ -389,12 +420,15 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                         ar_size_meters,
                         ar_orientation,
                         model_save_format,
+                        enhance,
                     )
                 except ValueError as exc:
                     async with queue_lock:
                         jobs[job_id].update(
                             {
                                 "status": "failed",
+                                "progress": jobs[job_id].get("progress", 0),
+                                "stage": "Failed",
                                 "error": str(exc),
                                 "finished_at": time.time(),
                             }
@@ -416,6 +450,8 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     jobs[job_id].update(
                         {
                             "status": "completed",
+                            "progress": 100,
+                            "stage": "Completed",
                             "finished_at": time.time(),
                             "mesh_url": result["mesh_url"],
                             "texture_url": result["texture_url"],
@@ -447,6 +483,8 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                     jobs[job_id].update(
                         {
                             "status": "failed",
+                            "progress": jobs[job_id].get("progress", 0),
+                            "stage": "Failed",
                             "error": str(exc),
                             "finished_at": time.time(),
                         }
@@ -484,6 +522,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
         ar_size_meters: float = Form(DEFAULT_AR_SIZE_METERS),
         ar_orientation: str = Form("auto"),
         model_save_format: str = Form("glb"),
+        enhance: bool = Form(False),
         webhook_url: Optional[str] = Form(None),
         webhook_job_ref: Optional[str] = Form(None),
         webhook_secret: Optional[str] = Form(None),
@@ -532,6 +571,8 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
                 "job_id": job_id,
                 "job_ref": webhook_job_ref,
                 "status": "queued",
+                "progress": 0,
+                "stage": "Queued",
                 "queued_at": time.time(),
                 "webhook_url": webhook_url,
                 "webhook_secret": webhook_secret,
@@ -564,6 +605,7 @@ def create_app(model, device: str, output_dir: Path, max_concurrent_jobs: int = 
             ar_orientation,
             model_save_format,
             queued_at,
+            enhance,
         )
 
         return JSONResponse(
